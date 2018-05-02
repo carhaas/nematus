@@ -88,6 +88,10 @@ class TranslationSettings(BaseSettings):
                                   help="Write n-best list (of size k)")
         self._parser.add_argument('--suppress-unk', action="store_true",
                                   help="Suppress hypotheses containing UNK.")
+        self._parser.add_argument('--json_log', '-l', type=argparse.FileType('w'),
+                                  default=None, metavar='PATH', help="Write json log for counterfactual learning.")
+        self._parser.add_argument('--references', '-r', type=argparse.FileType('r'),
+                                  default=None, metavar='PATH', help="Reference file, needed to write json log.")
         self._parser.add_argument('--print-word-probabilities', '-wp', dest="get_word_probs",
                                   action="store_true", help="Print probabilities of each word")
         self._parser.add_argument('--search_graph', '-sg', dest='search_graph_filename',

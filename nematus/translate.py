@@ -18,13 +18,15 @@ from compat import fill_options
 from hypgraph import HypGraphRenderer
 from settings import TranslationSettings
 
+from metrics.scorer_provider import ScorerProvider
+
 class Translation(object):
     #TODO move to separate file?
     """
     Models a translated segment.
     """
     def __init__(self, source_words, target_words, sentence_id=None, score=0, alignment=None,
-                 target_probs=None, hyp_graph=None, hypothesis_id=None):
+                 target_probs=None, hyp_graph=None, hypothesis_id=None, reference=None, evaluation_score=None):
         self.source_words = source_words
         self.target_words = target_words
         self.sentence_id = sentence_id
@@ -33,6 +35,8 @@ class Translation(object):
         self.target_probs = target_probs #TODO: assertion of length?
         self.hyp_graph = hyp_graph
         self.hypothesis_id = hypothesis_id
+        self.reference = reference
+        self.evaluation_score = evaluation_score
 
     def get_alignment(self):
         return self.alignment
@@ -187,6 +191,7 @@ class Translator(object):
         word_idict_trg[0] = '<eos>'
         word_idict_trg[1] = 'UNK'
 
+        self._word_dict_trg = word_dict_trg  # needed to create counterfactual logs
         self._word_idict_trg = word_idict_trg
 
     def _init_queues(self):
@@ -373,15 +378,23 @@ class Translator(object):
 
     ### WRITING TO AND READING FROM QUEUES ###
 
-    def _send_jobs(self, input_, translation_settings):
+    def _send_jobs(self, input_, translation_settings, ref_=None):
         """
         """
         source_sentences = []
+        ref_sentences = []
         for idx, line in enumerate(input_):
             if translation_settings.char_level:
                 words = list(line.decode('utf-8').strip())
             else:
                 words = line.strip().split()
+
+            target_words = None
+            if ref_ is not None:
+                if translation_settings.char_level:
+                    target_words = list(ref_[idx].decode('utf-8').strip())
+                else:
+                    target_words = ref_[idx].strip().split()
 
             x = []
             for w in words:
@@ -398,6 +411,11 @@ class Translator(object):
 
             x += [[0]*self._options[0]['factors']]
 
+            y = []
+            if target_words is not None:
+                y = [self._word_dict_trg[w] if w in self._word_dict_trg else 1
+                    for w in target_words]
+
             input_item = QueueItem(verbose=self._verbose,
                                    return_hyp_graph=translation_settings.get_search_graph,
                                    return_alignment=translation_settings.get_alignment,
@@ -408,11 +426,16 @@ class Translator(object):
                                    max_ratio=translation_settings.max_ratio,
                                    seq=x,
                                    idx=idx,
-                                   request_id=translation_settings.request_id)
+                                   request_id=translation_settings.request_id,
+                                   ref=y)
 
             self._input_queue.put(input_item)
             source_sentences.append(words)
-        return idx+1, source_sentences
+            if ref_ is not None:
+                ref_sentences.append(target_words)
+            else:
+                ref_sentences.append(None)
+        return idx+1, source_sentences, ref_sentences
 
     def _retrieve_jobs(self, num_samples, request_id, timeout=5):
         """
@@ -445,22 +468,31 @@ class Translator(object):
 
     ### EXPOSED TRANSLATION FUNCTIONS ###
 
-    def translate(self, source_segments, translation_settings):
+    def translate(self, source_segments, translation_settings, references=None, scorer=None):
         """
         Returns the translation of @param source_segments.
         """
         logging.info('Translating {0} segments...\n'.format(len(source_segments)))
-        n_samples, source_sentences = self._send_jobs(source_segments, translation_settings)
+        n_samples, source_sentences, ref_sentences = self._send_jobs(source_segments, translation_settings, ref_=references)
 
         translations = []
         for i, trans in enumerate(self._retrieve_jobs(n_samples, translation_settings.request_id)):
 
             samples, scores, word_probs, alignment, hyp_graph = trans
+            # references for the counterfactual log
+            reference = None
+            if references is not None and scorer is not None:
+                scorer.set_reference(ref_sentences[i])
+                reference = ref_sentences[i]
             # n-best list
             if translation_settings.n_best is True:
                 order = numpy.argsort(scores)
                 n_best_list = []
                 for j in order:
+                    evaluation_score = None
+                    target_words = seqs2words(samples[j], self._word_idict_trg, join=False)
+                    if references is not None and scorer is not None:
+                        evaluation_score = scorer.score(target_words)
                     current_alignment = None if not translation_settings.get_alignment else alignment[j]
                     translation = Translation(sentence_id=i,
                                               source_words=source_sentences[i],
@@ -469,27 +501,39 @@ class Translator(object):
                                               alignment=current_alignment,
                                               target_probs=word_probs[j],
                                               hyp_graph=hyp_graph,
-                                              hypothesis_id=j)
+                                              hypothesis_id=j,
+                                              reference=reference,
+                                              evaluation_score=evaluation_score)
                     n_best_list.append(translation)
                 translations.append(n_best_list)
             # single-best translation
             else:
                 current_alignment = None if not translation_settings.get_alignment else alignment
+                evaluation_score = None
+                target_words = seqs2words(samples, self._word_idict_trg, join=False)
+                if references is not None and scorer is not None:
+                    evaluation_score = scorer.score(target_words)
                 translation = Translation(sentence_id=i,
                                           source_words=source_sentences[i],
                                           target_words=seqs2words(samples, self._word_idict_trg, join=False),
                                           score=scores,
                                           alignment=current_alignment,
                                           target_probs=word_probs,
-                                          hyp_graph=hyp_graph)
+                                          hyp_graph=hyp_graph,
+                                          reference=reference,
+                                          evaluation_score=evaluation_score)
                 translations.append(translation)
         return translations
 
-    def translate_file(self, input_object, translation_settings):
+    def translate_file(self, input_object, translation_settings, reference_object=None, scorer=None):
         """
         """
         source_segments = input_object.readlines()
-        return self.translate(source_segments, translation_settings)
+        reference_segments = None
+        if reference_object is not None:
+            reference_segments = reference_object.readlines()
+            assert len(source_segments) == len(reference_segments)
+        return self.translate(source_segments, translation_settings, references=reference_segments, scorer=scorer)
 
 
     def translate_string(self, segment, translation_settings):
@@ -520,6 +564,19 @@ class Translator(object):
         else:
             output_file.write(translation.get_alignment_text() + "\n\n")
 
+    def write_json_log(self, translation, translation_settings):
+        """
+        Writes word probabilities to a file.
+        """
+        output_file = translation_settings.json_log
+        x = " ".join(translation.source_words)
+        y = " ".join(translation.target_words)
+        word_probs = numpy.array(translation.target_probs).tolist()
+        feedback = translation.evaluation_score
+        score = translation.score.item()
+        json.dump((x, y, word_probs, feedback, score), output_file)
+        output_file.write("\n")
+
     def write_translation(self, output_file, translation, translation_settings):
         """
         Writes a single translation to a file or STDOUT.
@@ -549,6 +606,10 @@ class Translator(object):
         if translation_settings.get_alignment:
             self.write_alignment(translation, translation_settings)
 
+        # write a log for counterfactual learning to a file?
+        if translation_settings.json_log:
+            self.write_json_log(translation, translation_settings)
+
         # construct hypgraph?
         if translation_settings.get_search_graph:
             translation.save_hyp_graph(
@@ -571,13 +632,16 @@ class Translator(object):
             for translation in translations:
                 self.write_translation(output_file, translation, translation_settings)
 
-def main(input_file, output_file, translation_settings):
+def main(input_file, output_file, translation_settings, references=None):
     """
     Translates a source language file (or STDIN) into a target language file
     (or STDOUT).
     """
+    scorer = None
+    if translation_settings.json_log:
+        scorer = ScorerProvider().get('SENTENCEBLEU n=4')
     translator = Translator(translation_settings)
-    translations = translator.translate_file(input_file, translation_settings)
+    translations = translator.translate_file(input_file, translation_settings, reference_object=references, scorer=scorer)
     translator.write_translations(output_file, translations, translation_settings)
 
     logging.info('Done')
@@ -589,7 +653,8 @@ if __name__ == "__main__":
     translation_settings = TranslationSettings(from_console_arguments=True)
     input_file = translation_settings.input
     output_file = translation_settings.output
+    reference_file = translation_settings.references
     # start logging
     level = logging.DEBUG if translation_settings.verbose else logging.WARNING
     logging.basicConfig(level=level, format='%(levelname)s: %(message)s')
-    main(input_file, output_file, translation_settings)
+    main(input_file, output_file, translation_settings, references=reference_file)
