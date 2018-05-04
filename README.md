@@ -1,3 +1,7 @@
+COUNTERFACTUAL LEARNING
+-----------------------
+This version of Nematus implements various counterfactual learning algorithms as described in [Lawrence & Riezler, 2018](https://arxiv.org/abs/1805.01252). For more details see [COUNTERFACTUAL.md](https://github.com/carhaas/nematus/blob/master/COUNTERFACTUAL.md).
+
 NEMATUS
 -------
 
