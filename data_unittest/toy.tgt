@@ -1,0 +1,10 @@
+query@3 area@1 keyval@2 name@0 Edinburgh@s nwr@1 keyval@2 amenity@0 embassy@s qtype@1 count@0
+query@3 area@1 keyval@2 name@0 Marseille@s nwr@1 keyval@2 leisure@0 stadium@s qtype@1 latlong@0
+query@3 area@1 keyval@2 name@0 Edinburgh@s nwr@1 keyval@2 amenity@0 fire_station@s qtype@1 latlong@0
+query@2 around@3 center@2 area@1 keyval@2 name@0 Berlin@s nwr@1 keyval@2 name@0 Arago@s search@1 nwr@1 keyval@2 highway@0 trunk_link@s maxdist@1 DIST_INTOWN@0 qtype@1 findkey@1 source@s
+query@3 area@1 keyval@2 name@0 Paris@s nwr@1 keyval@2 emergency@0 defibrillator@s qtype@1 count@0
+query@3 area@1 keyval@2 name@0 Grenoble@s nwr@1 keyval@2 railway@0 tram@s qtype@1 least@1 topx@1 1@0
+query@2 around@3 center@1 nwr@1 keyval@2 name@0 London@s search@1 nwr@1 keyval@2 building@0 commercial@s maxdist@1 DIST_INTOWN@0 qtype@1 latlong@0
+query@2 around@3 center@2 area@1 keyval@2 name@0 Paris@s nwr@1 keyval@2 amenity@0 cinema@s search@1 nwr@1 keyval@2 amenity@0 parking@s maxdist@1 WALKING_DIST@0 qtype@1 findkey@1 name@s
+query@2 around@3 center@1 nwr@1 keyval@2 name@0 London@s search@1 nwr@1 keyval@2 highway@0 emergency_access_point@s maxdist@1 DIST_INTOWN@0 qtype@1 latlong@0
+query@3 area@1 keyval@2 name@0 Bremen@s nwr@1 keyval@2 railway@0 light_rail@s qtype@1 least@1 topx@1 1@0
