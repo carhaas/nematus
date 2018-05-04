@@ -38,6 +38,7 @@ from optimizers import *
 from metrics.scorer_provider import ScorerProvider
 
 from domain_interpolation_data_iterator import DomainInterpolatorTextIterator
+from cl_log_iterator import ClLogIterator
 
 # batch preparation
 def prepare_data(seqs_x, seqs_y, weights=None, maxlen=None, n_words_src=30000,
@@ -564,7 +565,7 @@ def build_model(tparams, options):
     y_flat_idx = tensor.arange(y_flat.shape[0]) * options['n_words'] + y_flat
     cost = -tensor.log(probs.flatten()[y_flat_idx])
     cost = cost.reshape([y.shape[0], y.shape[1]])
-    cost = (cost * y_mask).sum(0)
+    cost = (cost * y_mask) # for token-level rewards in counterfactual learning, we stay with the word probabilities here
 
     #print "Print out in build_model()"
     #print opt_ret
@@ -672,6 +673,32 @@ def mrt_cost(cost, y_mask, options):
 
     return cost, loss
 
+def cl_cost(cost, options):
+    propensity = tensor.matrix('propensity', dtype=floatX)
+    reweigh_sum = tensor.scalar('reweigh_sum', dtype=floatX)
+    if not options['cl_word_rewards']:
+        reward = tensor.vector('reward', dtype=floatX)
+        cost = cost.sum(0)  # reduce to sequence level probablities
+        seq_level_propensity = propensity.sum(0)
+    else:
+        reward = tensor.matrix('reward', dtype=floatX)
+    local_reward = reward
+    if options['cl_word_rewards']:
+        # note: padding zeros need to remain zeros even after lifting out of log space, so we create a mask
+        mask = tensor.switch(tensor.eq(cost, 0), 0.0, 1.0)
+        cost = tensor.exp(-(cost - propensity)) * mask * local_reward
+        # reduce to sequence level
+        cost = tensor.switch(tensor.eq(cost, 0), 0.0, tensor.log(cost))
+        cost = cost.sum(0)
+        cost = tensor.exp(cost)
+    else:
+        cost = tensor.exp(-(cost - seq_level_propensity)) * local_reward
+    if options['cl_reweigh'] is True:
+        cost = cost.mean() / reweigh_sum
+    else:
+        cost = cost.mean()
+    cost = -cost  # prior to this its a reward
+    return cost, reward, propensity, reweigh_sum
 
 # build a sampler that produces samples in one theano function
 def build_full_sampler(tparams, options, use_noise, trng, greedy=False):
@@ -1143,6 +1170,7 @@ def train(dim_word=512,  # word vector dimensionality
           patience=10,  # early stopping patience
           max_epochs=5000,
           finish_after=10000000,  # finish after this many updates
+          finish_after_valids=200,  # finish after this many validation calls
           dispFreq=1000,
           decay_c=0.,  # L2 regularization penalty
           map_decay_c=0., # L2 regularization penalty towards original weights
@@ -1206,6 +1234,12 @@ def train(dim_word=512,  # word vector dimensionality
           decoder_truncate_gradient=-1, # Truncate BPTT gradients in the decoder to this value. Use -1 for no truncation
           layer_normalisation=False, # layer normalisation https://arxiv.org/abs/1607.06450
           weight_normalisation=False, # normalize weights
+          cl_log="",  # location of the log for counterfactual learning
+          cl_reweigh=False,  # use reweighing as a control variate
+          cl_deterministic=True,  # if False, then propensity scores are used
+          cl_word_rewards=False,  # if True, then rewards are exepected to be word level rewards
+          cl_external_reward=None,  # supply external file for rewards rather than using the reward recorded in the log
+          unittest=False,  # set to True by unittest scripts
     ):
 
     # Model options
@@ -1298,6 +1332,7 @@ def train(dim_word=512,  # word vector dimensionality
     training_progress.bad_counter = 0
     training_progress.anneal_restarts_done = 0
     training_progress.uidx = 0
+    training_progress.nr_validations = 0
     training_progress.eidx = 0
     training_progress.estop = False
     training_progress.history_errs = []
@@ -1315,6 +1350,7 @@ def train(dim_word=512,  # word vector dimensionality
     if training_progress.anneal_restarts_done > 0:
         lrate *= anneal_decay**training_progress.anneal_restarts_done
 
+    train_reweigh = None  # used for counterfactual learning with reweighing
     logging.info('Loading data')
     if use_domain_interpolation:
         logging.info('Using domain interpolation with initial ratio %s, final ratio %s, increase rate %s' % (training_progress.domain_interpolation_cur, domain_interpolation_max, domain_interpolation_inc))
@@ -1331,6 +1367,34 @@ def train(dim_word=512,  # word vector dimensionality
                          interpolation_rate=training_progress.domain_interpolation_cur,
                          use_factor=(factors > 1),
                          maxibatch_size=maxibatch_size)
+    elif model_options['objective'] == 'CL':
+        train = ClLogIterator(datasets[0], datasets[1],
+                              dictionaries[:-1], dictionaries[-1],
+                              model_options['cl_log'],
+                              n_words_source=n_words_src, n_words_target=n_words,
+                              batch_size=batch_size,
+                              maxlen=maxlen,
+                              skip_empty=True,
+                              shuffle_each_epoch=shuffle_each_epoch,
+                              sort_by_length=sort_by_length,
+                              use_factor=(factors > 1),
+                              maxibatch_size=maxibatch_size,
+                              external_reward=model_options['cl_external_reward'],
+                              word_rewards=model_options['cl_word_rewards'])
+        if model_options['cl_reweigh'] is True:
+            train_reweigh = ClLogIterator(datasets[0], datasets[1],
+                                          dictionaries[:-1], dictionaries[-1],
+                                          model_options['cl_log'],
+                                          n_words_source=n_words_src, n_words_target=n_words,
+                                          batch_size=1,
+                                          maxlen=maxlen,
+                                          skip_empty=True,
+                                          shuffle_each_epoch=shuffle_each_epoch,
+                                          sort_by_length=sort_by_length,
+                                          use_factor=(factors > 1),
+                                          maxibatch_size=maxibatch_size,
+                                          external_reward=model_options['cl_external_reward'],
+                                          word_rewards=model_options['cl_word_rewards'])
     else:
         train = TextIterator(datasets[0], datasets[1],
                          dictionaries[:-1], dictionaries[-1],
@@ -1343,7 +1407,7 @@ def train(dim_word=512,  # word vector dimensionality
                          use_factor=(factors > 1),
                          maxibatch_size=maxibatch_size)
 
-    if valid_datasets and validFreq:
+    if valid_datasets[0] and valid_datasets[1] and validFreq:
         valid = TextIterator(valid_datasets[0], valid_datasets[1],
                             dictionaries[:-1], dictionaries[-1],
                             n_words_source=n_words_src, n_words_target=n_words,
@@ -1407,22 +1471,25 @@ def train(dim_word=512,  # word vector dimensionality
 
     # before any regularizer
     logging.info('Building f_log_probs...')
-    f_log_probs = theano.function(inps, cost, profile=profile)
+    f_log_probs = theano.function(inps, cost.sum(0), profile=profile)
     logging.info('Done')
 
     if model_options['objective'] == 'CE':
-        cost = cost.mean()
+        cost = cost.sum(0).mean()
     elif model_options['objective'] == 'RAML':
         sample_weights = tensor.vector('sample_weights', dtype='floatX')
         cost *= sample_weights
-        cost = cost.mean()
+        cost = cost.sum(0).mean()
         inps += [sample_weights]
     elif model_options['objective'] == 'MRT':
         #MRT objective function
-        cost, loss = mrt_cost(cost, y_mask, model_options)
+        cost, loss = mrt_cost(cost.sum(0), y_mask, model_options)
         inps += [loss]
+    elif model_options['objective'] == 'CL':
+        cost, reward, propensity, reweigh_sum = cl_cost(cost, model_options)
+        inps += [reward, propensity, reweigh_sum]
     else:
-        logging.error('Objective must be one of ["CE", "MRT", "RAML"]')
+        logging.error('Objective must be one of ["CE", "CL", "MRT", "RAML"]')
         sys.exit(1)
 
     # apply L2 regularization on weights
@@ -1510,6 +1577,28 @@ def train(dim_word=512,  # word vector dimensionality
     last_words = 0
     ud_start = time.time()
     p_validation = None
+
+    reweigh_sum = 0.0
+    if cl_reweigh is True:  # initialise the reweigh sum
+        reweigh_sum = 0.0
+        number_reweigh_samples = 0.0
+        for x, y in train_reweigh:
+            number_reweigh_samples += len(x)
+            y_ref, reward, propensity, y_logged, _ = zip(*y)
+            x_prepared, x_mask, l_prepared, l_mask = prepare_data(x, y_logged, maxlen=None,
+                                                                  n_factors=factors,
+                                                                  n_words_src=n_words_src,
+                                                                  n_words=n_words)
+            pprobs = f_log_probs(x_prepared, x_mask, l_prepared, l_mask)
+            reweigh_sum_minibatch = numpy.exp(-pprobs)
+            if cl_deterministic is False:
+                propensity = numpy.exp(-numpy.array(propensity, dtype=floatX))
+                reweigh_sum_minibatch = reweigh_sum_minibatch / propensity
+            tmp = reweigh_sum_minibatch.sum()
+            reweigh_sum += reweigh_sum_minibatch.sum()
+        reweigh_sum /= number_reweigh_samples
+        logging.info('Reweigh Sum: %s' % reweigh_sum)
+
     for training_progress.eidx in xrange(training_progress.eidx, max_epochs):
         n_samples = 0
 
@@ -1554,6 +1643,8 @@ def train(dim_word=512,  # word vector dimensionality
                     cost = f_update(lrate, x, x_mask, y, y_mask, sample_weights)
                 else:
                     cost = f_update(lrate, x, x_mask, y, y_mask)
+                if unittest:
+                    return cost
                 cost_sum += cost
 
             elif model_options['objective'] == 'MRT':
@@ -1638,7 +1729,47 @@ def train(dim_word=512,  # word vector dimensionality
 
                     # compute cost, grads and update parameters
                     cost = f_update(lrate, x, x_mask, y, y_mask, loss)
+                    if unittest:
+                        return cost
                     cost_sum += cost
+            elif model_options['objective'] == 'CL':
+                y_ref, reward, propensity, y_logged, word_prob = zip(*y)
+                cost_batches += 1
+                x, x_mask, l_prepared, l_mask = prepare_data(x, y_logged, maxlen=None,
+                                                             n_factors=factors,
+                                                             n_words_src=n_words_src,
+                                                             n_words=n_words)
+                prepared_rewards = [0.0] * len(l_prepared[0])
+                prepared_word_propensities = [0.0] * len(l_prepared[0])
+                for i, (l_prepared_i, word_prob_i) in enumerate(zip(l_prepared.transpose().tolist(), word_prob)):
+                    # word rewards and word probabilities need to be filled accordingly into the matrix of the minibatch
+                    if cl_deterministic is False:
+                        current_word_prop = numpy.array(word_prob_i + [0.0] * (len(l_prepared_i) - len(word_prob_i)))
+                        prepared_word_propensities[i] = numpy.where(current_word_prop > 0.0,
+                                                                    -numpy.log(current_word_prop), 0.0)
+                    else:
+                        prepared_word_propensities[i] = [0.0] * len(l_prepared_i)
+                    if cl_word_rewards:
+                        prepared_rewards[i] = [0.0] * len(l_prepared_i)
+                        for j, element in enumerate(l_prepared_i):
+                            if element == 0:  # then eos is reached
+                                break
+                            prepared_rewards[i][j] = reward[i][j]
+
+                if cl_word_rewards:
+                    prepared_rewards = numpy.array(prepared_rewards, dtype=floatX).transpose()
+                else:
+                    prepared_rewards = numpy.array(reward, dtype=floatX).transpose()
+
+                prepared_word_propensities = numpy.array(prepared_word_propensities, dtype=floatX).transpose()
+                cost = f_update(lrate, x, x_mask, l_prepared, l_mask, prepared_rewards, prepared_word_propensities,
+                                numpy.array(reweigh_sum, dtype=floatX))
+                logging.info('Cost: %s' % cost)
+
+                if unittest:
+                    return cost
+                cost_sum += cost
+                y = l_prepared  # the generate samples code below expects variable y to be set via prepare_data
 
             # check for bad numbers, usually we remove non-finite elements
             # and continue training - but not done here
@@ -1802,6 +1933,7 @@ def train(dim_word=512,  # word vector dimensionality
 
                 logging.info('Valid {}'.format(valid_err))
 
+                training_progress.nr_validations += 1
                 if external_validation_script:
                     logging.info("Calling external validation script")
                     if p_validation is not None and p_validation.poll() is None:
@@ -1816,7 +1948,35 @@ def train(dim_word=512,  # word vector dimensionality
                     save(params, optimizer_params, training_progress, saveto+'.dev')
                     json.dump(model_options, open('%s.dev.npz.json' % saveto, 'wb'), indent=2)
                     logging.info('Done')
-                    p_validation = Popen([external_validation_script])
+                    external_validation_script_plus_counter = external_validation_script + " %s" % training_progress.nr_validations
+                    popen_args = external_validation_script_plus_counter.split(" ")
+                    logging.info('Calling validation script: %s' % popen_args)
+                    p_validation = Popen(popen_args)
+
+                if cl_reweigh is True:  # re-calculate the reweigh sum
+                    reweigh_sum = 0.0
+                    number_reweigh_samples = 0.0
+                    for x, y in train_reweigh:
+                        number_reweigh_samples += len(x)
+                        y_ref, reward, propensity, y_logged, _ = zip(*y)
+                        x_prepared, x_mask, l_prepared, l_mask = prepare_data(x, y_logged, maxlen=None,
+                                                                              n_factors=factors,
+                                                                              n_words_src=n_words_src,
+                                                                              n_words=n_words)
+                        pprobs = f_log_probs(x_prepared, x_mask, l_prepared, l_mask)
+                        reweigh_sum_minibatch = numpy.exp(-pprobs)
+                        if cl_deterministic is False:
+                            propensity = numpy.exp(-numpy.array(propensity, dtype=floatX))
+                            reweigh_sum_minibatch = reweigh_sum_minibatch / propensity
+                        reweigh_sum += reweigh_sum_minibatch.sum()
+                    reweigh_sum /= number_reweigh_samples
+                    logging.info('Reweigh Sum: %s' % reweigh_sum)
+
+                    # finish after this many validations
+                if training_progress.nr_validations >= finish_after_valids:
+                    print 'Finishing after %d validations!' % training_progress.nr_validations
+                    training_progress.estop = True
+                    break
 
             # finish after this many updates
             if training_progress.uidx >= finish_after:
@@ -1947,6 +2107,8 @@ if __name__ == '__main__':
                          help="maximum number of epochs (default: %(default)s)")
     training.add_argument('--finish_after', type=int, default=10000000, metavar='INT',
                          help="maximum number of updates (minibatches) (default: %(default)s)")
+    training.add_argument('--finish_after_valids', type=int, default=200, metavar='INT',
+                          help="maximum number of validation calls (default: %(default)s)")
     training.add_argument('--decay_c', type=float, default=0, metavar='FLOAT',
                          help="L2 regularization penalty (default: %(default)s)")
     training.add_argument('--map_decay_c', type=float, default=0, metavar='FLOAT',
@@ -1970,6 +2132,7 @@ if __name__ == '__main__':
                          help="truncate BPTT gradients in the encoder to this value. Use -1 for no truncation (default: %(default)s)")
     training.add_argument('--decoder_truncate_gradient', type=int, default=-1, metavar='INT',
                          help="truncate BPTT gradients in the encoder to this value. Use -1 for no truncation (default: %(default)s)")
+    training.add_argument('--unittest', action="store_true", help='true if unittest is to be run')
 
     validation = parser.add_argument_group('validation parameters')
     validation.add_argument('--valid_datasets', type=str, default=None, metavar='PATH', nargs=2,
@@ -2026,6 +2189,18 @@ if __name__ == '__main__':
                          help="interpolation increment to be applied each time patience runs out, until maximum amount of interpolation is reached (default: %(default)s)")
     domain_interpolation.add_argument('--domain_interpolation_indomain_datasets', type=str, metavar='PATH', nargs=2,
                          help="indomain parallel training corpus (source and target)")
+
+    cl = parser.add_argument_group('counterfactual learning parameters')
+    cl.add_argument('--cl_log', type=str, default='', metavar='STR',
+                    help="location of the log from which to learn")
+    cl.add_argument('--cl_reweigh', action="store_true",
+                    help='true if the objective should use reweighing')
+    cl.add_argument('--cl_deterministic', action="store_true",
+                    help='true if propensity should be set to 1')
+    cl.add_argument('--cl_word_rewards', action="store_true",
+                    help='true if rewards are given for words')
+    cl.add_argument('--cl_external_reward', type=str, default=None, metavar='STR',
+                    help="location of a file with external rewards")
 
     args = parser.parse_args()
 
