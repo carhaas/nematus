@@ -68,3 +68,7 @@ cl_reweigh=True
 cl_word_rewards=True
 cl_external_reward=PATH/TO/WORD_REWARDS
 ```
+
+NOTE
+----
+Note that unittests cannot be run without the correct model.npz which is too large to upload.
