@@ -673,6 +673,9 @@ def mrt_cost(cost, y_mask, options):
 
     return cost, loss
 
+# counterfactual learning
+# assumes a log that contains: input sequence, output sequence produced by a logging policy,
+# propensity (=probability) for the output sequence and an associated reward
 def cl_cost(cost, options):
     propensity = tensor.matrix('propensity', dtype=floatX)
     reweigh_sum = tensor.scalar('reweigh_sum', dtype=floatX)
@@ -682,22 +685,21 @@ def cl_cost(cost, options):
         seq_level_propensity = propensity.sum(0)
     else:
         reward = tensor.matrix('reward', dtype=floatX)
-    local_reward = reward
     if options['cl_word_rewards']:
         # note: padding zeros need to remain zeros even after lifting out of log space, so we create a mask
         mask = tensor.switch(tensor.eq(cost, 0), 0.0, 1.0)
-        cost = tensor.exp(-(cost - propensity)) * mask * local_reward
+        cost = tensor.exp(-(cost - propensity)) * mask * reward
         # reduce to sequence level
         cost = tensor.switch(tensor.eq(cost, 0), 0.0, tensor.log(cost))
         cost = cost.sum(0)
         cost = tensor.exp(cost)
     else:
-        cost = tensor.exp(-(cost - seq_level_propensity)) * local_reward
+        cost = tensor.exp(-(cost - seq_level_propensity)) * reward
     if options['cl_reweigh'] is True:
         cost = cost.mean() / reweigh_sum
     else:
         cost = cost.mean()
-    cost = -cost  # prior to this its a reward
+    cost = -cost  # prior to this it's a reward
     return cost, reward, propensity, reweigh_sum
 
 # build a sampler that produces samples in one theano function
@@ -1579,7 +1581,7 @@ def train(dim_word=512,  # word vector dimensionality
     p_validation = None
 
     reweigh_sum = 0.0
-    if cl_reweigh is True:  # initialise the reweigh sum
+    if model_options['objective'] == 'CL' and cl_reweigh is True:  # initialise the reweigh sum
         reweigh_sum = 0.0
         number_reweigh_samples = 0.0
         for x, y in train_reweigh:
@@ -1594,7 +1596,6 @@ def train(dim_word=512,  # word vector dimensionality
             if cl_deterministic is False:
                 propensity = numpy.exp(-numpy.array(propensity, dtype=floatX))
                 reweigh_sum_minibatch = reweigh_sum_minibatch / propensity
-            tmp = reweigh_sum_minibatch.sum()
             reweigh_sum += reweigh_sum_minibatch.sum()
         reweigh_sum /= number_reweigh_samples
         logging.info('Reweigh Sum: %s' % reweigh_sum)
@@ -1733,18 +1734,23 @@ def train(dim_word=512,  # word vector dimensionality
                         return cost
                     cost_sum += cost
             elif model_options['objective'] == 'CL':
-                y_ref, reward, propensity, y_logged, word_prob = zip(*y)
+                # propensity: probability under the logging policy
+                _, reward, propensity, y_logged, word_propensity = zip(*y)
                 cost_batches += 1
+                # prepare_data for minibatch: x contains the word IDs of the source sentences as a matrix, where each column is one sentence
+                # the size of the matrix is defined by the longest sentence in the minibatch, shorter sentences are padded with 0
+                # x_mask: like x but has 1 instead of word IDs
+                # l_prepared: same as x but for the target sentence, l_mask: analogous to x_mask
                 x, x_mask, l_prepared, l_mask = prepare_data(x, y_logged, maxlen=None,
                                                              n_factors=factors,
                                                              n_words_src=n_words_src,
                                                              n_words=n_words)
+                # word rewards and word propensities need to have the same shape as l_prepared
                 prepared_rewards = [0.0] * len(l_prepared[0])
                 prepared_word_propensities = [0.0] * len(l_prepared[0])
-                for i, (l_prepared_i, word_prob_i) in enumerate(zip(l_prepared.transpose().tolist(), word_prob)):
-                    # word rewards and word probabilities need to be filled accordingly into the matrix of the minibatch
+                for i, (l_prepared_i, word_prop_i) in enumerate(zip(l_prepared.transpose().tolist(), word_propensity)):
                     if cl_deterministic is False:
-                        current_word_prop = numpy.array(word_prob_i + [0.0] * (len(l_prepared_i) - len(word_prob_i)))
+                        current_word_prop = numpy.array(word_prop_i + [0.0] * (len(l_prepared_i) - len(word_prop_i)))
                         prepared_word_propensities[i] = numpy.where(current_word_prop > 0.0,
                                                                     -numpy.log(current_word_prop), 0.0)
                     else:
@@ -1762,14 +1768,15 @@ def train(dim_word=512,  # word vector dimensionality
                     prepared_rewards = numpy.array(reward, dtype=floatX).transpose()
 
                 prepared_word_propensities = numpy.array(prepared_word_propensities, dtype=floatX).transpose()
+                # will envoke the function cl_cost
                 cost = f_update(lrate, x, x_mask, l_prepared, l_mask, prepared_rewards, prepared_word_propensities,
                                 numpy.array(reweigh_sum, dtype=floatX))
                 logging.info('Cost: %s' % cost)
 
                 if unittest:
-                    return cost
+                    return cost, prepared_rewards, prepared_word_propensities, reweigh_sum
                 cost_sum += cost
-                y = l_prepared  # the generate samples code below expects variable y to be set via prepare_data
+                y = l_prepared  # the code below to generate samples expects variable y to be set
 
             # check for bad numbers, usually we remove non-finite elements
             # and continue training - but not done here
@@ -1953,7 +1960,7 @@ def train(dim_word=512,  # word vector dimensionality
                     logging.info('Calling validation script: %s' % popen_args)
                     p_validation = Popen(popen_args)
 
-                if cl_reweigh is True:  # re-calculate the reweigh sum
+                if model_options['objective'] == 'CL' and cl_reweigh is True:  # re-calculate the reweigh sum
                     reweigh_sum = 0.0
                     number_reweigh_samples = 0.0
                     for x, y in train_reweigh:
