@@ -1737,6 +1737,7 @@ def train(dim_word=512,  # word vector dimensionality
                 # propensity: probability under the logging policy
                 _, reward, propensity, y_logged, word_propensity = zip(*y)
                 cost_batches += 1
+
                 # prepare_data for minibatch: x contains the word IDs of the source sentences as a matrix, where each column is one sentence
                 # the size of the matrix is defined by the longest sentence in the minibatch, shorter sentences are padded with 0
                 # x_mask: like x but has 1 instead of word IDs
@@ -1745,22 +1746,19 @@ def train(dim_word=512,  # word vector dimensionality
                                                              n_factors=factors,
                                                              n_words_src=n_words_src,
                                                              n_words=n_words)
+
                 # word rewards and word propensities need to have the same shape as l_prepared
                 prepared_rewards = [0.0] * len(l_prepared[0])
                 prepared_word_propensities = [0.0] * len(l_prepared[0])
-                for i, (l_prepared_i, word_prop_i) in enumerate(zip(l_prepared.transpose().tolist(), word_propensity)):
+                for i, l_prepared_i in enumerate(l_prepared.transpose().tolist()):
                     if cl_deterministic is False:
-                        current_word_prop = numpy.array(word_prop_i + [0.0] * (len(l_prepared_i) - len(word_prop_i)))
+                        current_word_prop = numpy.array(word_propensity[i] + [0.0] * (len(l_prepared_i) - len(word_propensity[i])))
                         prepared_word_propensities[i] = numpy.where(current_word_prop > 0.0,
                                                                     -numpy.log(current_word_prop), 0.0)
                     else:
                         prepared_word_propensities[i] = [0.0] * len(l_prepared_i)
                     if cl_word_rewards:
-                        prepared_rewards[i] = [0.0] * len(l_prepared_i)
-                        for j, element in enumerate(l_prepared_i):
-                            if element == 0:  # then eos is reached
-                                break
-                            prepared_rewards[i][j] = reward[i][j]
+                        prepared_rewards[i] =  numpy.array(reward[i] + [0.0] * (len(l_prepared_i) - len(reward[i])))
 
                 if cl_word_rewards:
                     prepared_rewards = numpy.array(prepared_rewards, dtype=floatX).transpose()
