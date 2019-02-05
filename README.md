@@ -1,3 +1,8 @@
+RAMP LOSS OBJECTIVES
+-----------------------
+This version of Nematus implements various ramp loss objectives as described in [Jehl et al., 2019](TODO). For more details see [RAMP.md](https://github.com/carhaas/nematus/blob/master/RAMP.md).
+
+
 COUNTERFACTUAL LEARNING
 -----------------------
 This version of Nematus implements various counterfactual learning algorithms as described in [Lawrence & Riezler, 2018](https://arxiv.org/abs/1805.01252). For more details see [COUNTERFACTUAL.md](https://github.com/carhaas/nematus/blob/master/COUNTERFACTUAL.md).

@@ -7,6 +7,7 @@ from sentence_bleu import SentenceBleuScorer
 from meteor import MeteorScorer
 from beer import BeerScorer
 from chrf import CharacterFScorer
+from seq import SeqScorer
 
 class ScorerProvider:
     """
@@ -49,6 +50,8 @@ class ScorerProvider:
             return BeerScorer(arguments)
         elif scorer == 'CHRF':
             return CharacterFScorer(arguments)
+        elif scorer == 'seq':
+            return SeqScorer(arguments)
         # add other scorers here
         else:
             raise NotImplementedError("No such scorer: %s" % scorer)

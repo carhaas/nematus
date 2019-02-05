@@ -19,7 +19,8 @@ import logging
 
 import itertools
 
-from subprocess import Popen
+import subprocess
+from threading import Timer
 
 from collections import OrderedDict
 
@@ -36,9 +37,14 @@ from layers import *
 from initializers import *
 from optimizers import *
 from metrics.scorer_provider import ScorerProvider
+from metrics.nlmaps_query import get_nlmaps_answer
 
 from domain_interpolation_data_iterator import DomainInterpolatorTextIterator
 from cl_log_iterator import ClLogIterator
+from ramp_data_iterator import RampTextIterator
+
+from pymemcache.client import base
+import mmh3
 
 # batch preparation
 def prepare_data(seqs_x, seqs_y, weights=None, maxlen=None, n_words_src=30000,
@@ -76,17 +82,24 @@ def prepare_data(seqs_x, seqs_y, weights=None, maxlen=None, n_words_src=30000,
 
     n_samples = len(seqs_x)
     maxlen_x = numpy.max(lengths_x) + 1
-    maxlen_y = numpy.max(lengths_y) + 1
+    maxlen_y = 1
+    if len(seqs_y) > 0:
+        maxlen_y = numpy.max(lengths_y) + 1
 
     x = numpy.zeros((n_factors, maxlen_x, n_samples)).astype('int64')
     y = numpy.zeros((maxlen_y, n_samples)).astype('int64')
     x_mask = numpy.zeros((maxlen_x, n_samples)).astype(floatX)
     y_mask = numpy.zeros((maxlen_y, n_samples)).astype(floatX)
-    for idx, [s_x, s_y] in enumerate(zip(seqs_x, seqs_y)):
-        x[:, :lengths_x[idx], idx] = zip(*s_x)
-        x_mask[:lengths_x[idx]+1, idx] = 1.
-        y[:lengths_y[idx], idx] = s_y
-        y_mask[:lengths_y[idx]+1, idx] = 1.
+    if len(seqs_y) > 0:
+        for idx, [s_x, s_y] in enumerate(zip(seqs_x, seqs_y)):
+            x[:, :lengths_x[idx], idx] = zip(*s_x)
+            x_mask[:lengths_x[idx] + 1, idx] = 1.
+            y[:lengths_y[idx], idx] = s_y
+            y_mask[:lengths_y[idx] + 1, idx] = 1.
+    else:
+        for idx, s_x in enumerate(seqs_x):
+            x[:, :lengths_x[idx], idx] = zip(*s_x)
+            x_mask[:lengths_x[idx] + 1, idx] = 1.
     if weights is not None:
         return x, x_mask, y, y_mask, weights
     else:
@@ -673,6 +686,27 @@ def mrt_cost(cost, y_mask, options):
 
     return cost, loss
 
+# ramp cost
+# encourages a set of hope sequences and discourages a set of fear squences
+def ramp_cost(cost, options):
+    # entries prior to this index are hope and are encouraged
+    # entries past this index are fear and are discouraged
+    fear_start_idx = tensor.iscalar('fear_start_idx')
+
+    if not options['ramp_word_rewards']:
+        reward = tensor.vector('reward', dtype=floatX)
+        cost = cost.sum(0)  # reduce to sequence level probablities
+        cost *= reward
+        cost = cost[:fear_start_idx].mean() - cost[fear_start_idx:].mean()  # first part is hope, second fear
+    else:
+        reward = tensor.matrix('reward', dtype=floatX)
+        cost *= reward
+        # reduce to sequence level
+        cost = cost.sum(0)  # reduce to sequence level probablities
+        cost = cost[:fear_start_idx].mean() - cost[fear_start_idx:].mean()  # first part is hope, second fear
+
+    return cost, fear_start_idx, reward
+    
 # counterfactual learning
 # assumes a log that contains: input sequence, output sequence produced by a logging policy,
 # propensity (=probability) for the output sequence and an associated reward
@@ -1218,7 +1252,9 @@ def train(dim_word=512,  # word vector dimensionality
           anneal_decay=0.5, # decay learning rate by this amount on each restart
           maxibatch_size=20, #How many minibatches to load at one time
           objective="CE", #CE: cross-entropy; MRT: minimum risk training (see https://www.aclweb.org/anthology/P/P16/P16-1159.pdf) \
-                          #RAML: reward-augmented maximum likelihood (see https://papers.nips.cc/paper/6547-reward-augmented-maximum-likelihood-for-neural-structured-prediction.pdf)
+                          #RAML: reward-augmented maximum likelihood (see https://papers.nips.cc/paper/6547-reward-augmented-maximum-likelihood-for-neural-structured-prediction.pdf) \
+                          #CL: counterfactual learning (see http://www.aclweb.org/anthology/D/D17/D17-1272.pdf)
+                          #RAMP: Ramp1, Ramp2 and Ramp objectives (see TODO)
           mrt_alpha=0.005,
           mrt_samples=100,
           mrt_samples_meanloss=10,
@@ -1228,6 +1264,16 @@ def train(dim_word=512,  # word vector dimensionality
           raml_tau=0.85, # in (0,1] 0: becomes equivalent to ML
           raml_samples=1,
           raml_reward="hamming_distance",
+          ramp_weak_gold=None,  # file location for the answer file, required for the ramp setting
+          ramp_nbest=100,
+          ramp_nloop=10,
+          ramp_execution_script=None,
+          ramp_normalization_alpha=1.0,
+          ramp_reuse_previous=True,
+          ramp_top1_is_hope=False, # True for Ramp1
+          ramp_top1_is_fear=False, # True for Ramp2
+          ramp_word_rewards=False,          
+          use_memcache=True, # To cache executed queries for semantic parsing under MRT or RAMP
           model_version=0.1, #store version used for training for compatibility
           prior_model=None, # Prior model file, used for MAP
           tie_encoder_decoder_embeddings=False, # Tie the input embeddings of the encoder and the decoder (first factor only)
@@ -1327,6 +1373,8 @@ def train(dim_word=512,  # word vector dimensionality
         batch_size = batch_size // model_options['raml_samples']
         logging.info('Running in RAML mode, minibatch size divided by number of samples, set to %d' % batch_size)
 
+    ramp_weak_gold_dict = {}
+        
     # initialize training progress
     training_progress = TrainingProgress()
     best_p = None
@@ -1338,6 +1386,7 @@ def train(dim_word=512,  # word vector dimensionality
     training_progress.eidx = 0
     training_progress.estop = False
     training_progress.history_errs = []
+    training_progress.ramp_dict = {}
     training_progress.domain_interpolation_cur = domain_interpolation_min if use_domain_interpolation else None
     # reload training progress
     training_progress_file = saveto + '.progress.json'
@@ -1351,6 +1400,10 @@ def train(dim_word=512,  # word vector dimensionality
     # adjust learning rate if we resume process that has already entered annealing phase
     if training_progress.anneal_restarts_done > 0:
         lrate *= anneal_decay**training_progress.anneal_restarts_done
+
+    if model_options['objective'] == 'RAMP':
+        assert model_options['ramp_weak_gold']
+        assert model_options['ramp_execution_script']
 
     train_reweigh = None  # used for counterfactual learning with reweighing
     logging.info('Loading data')
@@ -1369,6 +1422,28 @@ def train(dim_word=512,  # word vector dimensionality
                          interpolation_rate=training_progress.domain_interpolation_cur,
                          use_factor=(factors > 1),
                          maxibatch_size=maxibatch_size)
+    elif model_options['objective'] == 'RAMP':
+        train = RampTextIterator(datasets[0],
+                             dictionaries[:-1], dictionaries[-1],
+                             n_words_source=n_words_src, n_words_target=n_words,
+                             batch_size=batch_size,
+                             maxlen=maxlen,
+                             skip_empty=True,
+                             shuffle_each_epoch=shuffle_each_epoch,
+                             use_factor=(factors > 1),
+                             maxibatch_size=maxibatch_size,
+                             ramp_weak_gold=model_options['ramp_weak_gold'])
+    elif model_options['objective'] == 'MRT' and model_options['ramp_weak_gold'] is not None: # seq is the indiactor that MRT is used for semantic parsing
+        train = RampTextIterator(datasets[0],
+                             dictionaries[:-1], dictionaries[-1],
+                             n_words_source=n_words_src, n_words_target=n_words,
+                             batch_size=batch_size,
+                             maxlen=maxlen,
+                             skip_empty=True,
+                             shuffle_each_epoch=shuffle_each_epoch,
+                             use_factor=(factors > 1),
+                             maxibatch_size=maxibatch_size,
+                             ramp_weak_gold=model_options['ramp_weak_gold'])
     elif model_options['objective'] == 'CL':
         train = ClLogIterator(datasets[0], datasets[1],
                               dictionaries[:-1], dictionaries[-1],
@@ -1419,6 +1494,13 @@ def train(dim_word=512,  # word vector dimensionality
     else:
         valid = None
 
+    client = None
+    if use_memcache:
+        try:
+            client = base.Client(('localhost', 11211))
+        except:
+            logging.info("memcache operation failed: establish client")
+            
     comp_start = time.time()
 
     logging.info('Building model')
@@ -1464,7 +1546,7 @@ def train(dim_word=512,  # word vector dimensionality
 
     inps = [x, x_mask, y, y_mask]
 
-    if validFreq or sampleFreq:
+    if validFreq or sampleFreq or model_options['objective'] == 'RAMP':
         logging.info('Building sampler')
         f_init, f_next = build_sampler(tparams, model_options, use_noise, trng)
     if model_options['objective'] == 'MRT':
@@ -1487,11 +1569,15 @@ def train(dim_word=512,  # word vector dimensionality
         #MRT objective function
         cost, loss = mrt_cost(cost.sum(0), y_mask, model_options)
         inps += [loss]
+    elif model_options['objective'] == 'RAMP':
+        # RAMP objective function
+        cost, fear_start_idx, reward = ramp_cost(cost, model_options)
+        inps += [fear_start_idx, reward]
     elif model_options['objective'] == 'CL':
         cost, reward, propensity, reweigh_sum = cl_cost(cost, model_options)
         inps += [reward, propensity, reweigh_sum]
     else:
-        logging.error('Objective must be one of ["CE", "CL", "MRT", "RAML"]')
+        logging.error('Objective must be one of ["CE", "CL", "MRT", "RAML", "RAMP"]')
         sys.exit(1)
 
     # apply L2 regularization on weights
@@ -1602,6 +1688,7 @@ def train(dim_word=512,  # word vector dimensionality
 
     for training_progress.eidx in xrange(training_progress.eidx, max_epochs):
         n_samples = 0
+        ramp_skip = False
 
         for x, y in train:
             training_progress.uidx += 1
@@ -1662,7 +1749,7 @@ def train(dim_word=512,  # word vector dimensionality
                 for x_s, y_s in xy_pairs:
 
                     # add EOS and prepare factored data
-                    x, _, _, _ = prepare_data([x_s], [y_s], maxlen=None,
+                    x, _, _, _ = prepare_data([x_s], [], maxlen=None,
                                               n_factors=factors,
                                               n_words_src=n_words_src, n_words=n_words)
 
@@ -1672,20 +1759,26 @@ def train(dim_word=512,  # word vector dimensionality
                         samples, _ = f_sampler(x, model_options['mrt_samples_meanloss'], maxlen)
                         use_noise.set_value(1.)
 
-                        samples = [numpy.trim_zeros(item) for item in zip(*samples)]
+                        samples = [item for item in zip(*samples)]
 
                         # map integers to words (for character-level metrics)
-                        samples = [seqs2words(sample, worddicts_r[-1]) for sample in samples]
-                        ref = seqs2words(y_s, worddicts_r[-1])
+                        samples_text = [seqs2words(sample[:-1], worddicts_r[-1]) for sample in samples]
+                        samples_answers = [""] * len(samples_text)
 
-                        #scorers expect tokenized hypotheses/references
-                        ref = ref.split(" ")
-                        samples = [sample.split(" ") for sample in samples]
+                        if model_options['ramp_weak_gold'] is not None: # indicator for the semantic parsing task, where we need to retrieve answers and compare them to gold answers
+                            # get answers                        
+                            for sample_idx, sample_text in enumerate(samples_text):
+                                sample_answer = get_nlmaps_answer(sample_text, model_options, client, ramp_weak_gold_dict)
+                                if sample_answer == "timeout":
+                                    continue
+
+                        # scorers expect tokenized hypotheses/references
+                        ref = y_s.split(" ")
 
                         # get negative smoothed BLEU for samples
                         scorer = ScorerProvider().get(model_options['mrt_loss'])
                         scorer.set_reference(ref)
-                        mean_loss = numpy.array(scorer.score_matrix(samples), dtype=floatX).mean()
+                        mean_loss = numpy.array(scorer.score_matrix(samples_answers), dtype=floatX).mean()
                     else:
                         mean_loss = 0.
 
@@ -1694,11 +1787,14 @@ def train(dim_word=512,  # word vector dimensionality
                     samples, _ = f_sampler(x, model_options['mrt_samples'], maxlen)
                     use_noise.set_value(1.)
 
-                    samples = [numpy.trim_zeros(item) for item in zip(*samples)]
+                    samples = [item for item in zip(*samples)]
 
                     # remove duplicate samples
                     samples.sort()
                     samples = [s for s, _ in itertools.groupby(samples)]
+                    # map integers to words (for character-level metrics)
+                    samples_text = [seqs2words(sample[:-1], worddicts_r[-1]) for sample in samples]
+                    samples_answers = [""] * len(samples_text)
 
                     # add gold translation [always in first position]
                     if model_options['mrt_reference'] or model_options['mrt_ml_mix']:
@@ -1706,33 +1802,254 @@ def train(dim_word=512,  # word vector dimensionality
 
                     # create mini-batch with masking
                     x, x_mask, y, y_mask = prepare_data([x_s for _ in xrange(len(samples))], samples,
-                                                                    maxlen=None,
-                                                                    n_factors=factors,
-                                                                    n_words_src=n_words_src,
-                                                                    n_words=n_words)
+                                                        maxlen=None,
+                                                        n_factors=factors,
+                                                        n_words_src=n_words_src,
+                                                        n_words=n_words)
 
                     cost_batches += 1
                     last_disp_samples += xlen
-                    last_words += (numpy.sum(x_mask) + numpy.sum(y_mask))/2.0
+                    last_words += (numpy.sum(x_mask) + numpy.sum(y_mask)) / 2.0
 
                     # map integers to words (for character-level metrics)
                     samples = [seqs2words(sample, worddicts_r[-1]) for sample in samples]
-                    y_s = seqs2words(y_s, worddicts_r[-1])
 
-                    #scorers expect tokenized hypotheses/references
+                    # scorers expect tokenized hypotheses/references
                     y_s = y_s.split(" ")
                     samples = [sample.split(" ") for sample in samples]
+
+                    if model_options['ramp_weak_gold'] is not None: # indicator for the semantic parsing task, where we need to retrieve answers and compare them to gold answers
+                        # get answers
+                        for sample_idx, sample_text in enumerate(samples_text):
+                            sample_answer = get_nlmaps_answer(sample_text, model_options, client, ramp_weak_gold_dict)
+                            if sample_answer is None:
+                                logging.info("sample answer is none for: %s" % sample_text)
+                                continue
+                            if sample_answer == "timeout":
+                                continue
+                            samples_answers[sample_idx] = sample_answer.split(" ")
 
                     # get negative smoothed BLEU for samples
                     scorer = ScorerProvider().get(model_options['mrt_loss'])
                     scorer.set_reference(y_s)
-                    loss = mean_loss - numpy.array(scorer.score_matrix(samples), dtype=floatX)
-
+                    loss = numpy.array(scorer.score_matrix(samples_answers), dtype=floatX)
+                    loss = mean_loss - loss
                     # compute cost, grads and update parameters
                     cost = f_update(lrate, x, x_mask, y, y_mask, loss)
-                    if unittest:
-                        return cost
+                    logging.info('cost: %s' % cost)
                     cost_sum += cost
+            elif model_options['objective'] == 'RAMP':
+                # because we do -fear, we need to formulate -reward for fear
+                ramp_weak_gold = y
+                xlen = len(x)
+                n_samples += xlen
+
+                assert maxlen is not None and maxlen > 0
+
+                xr_pairs = [(x_i, r_i) for (x_i, r_i) in zip(x, ramp_weak_gold) if
+                             len(x_i) < maxlen]
+                if not xr_pairs:
+                    training_progress.uidx -= 1
+                    continue
+
+                hope = []
+                fear = []
+                hope_scores = []
+                fear_scores = []
+                hope_sources = []
+                fear_sources = []
+                reward_hope = []
+                reward_fear = []
+                for x_s, r_s in xr_pairs:
+                    logging.info("new source")
+                    source_id = []
+                    for id in x_s:
+                        source_id.append(id[0]) # transform x_s so that we can obtain the original text
+                    source_text = seqs2words(source_id, worddicts_r[0])
+                    # add EOS and prepare factored data
+                    x, _, _, _ = prepare_data([x_s], [], maxlen=None,
+                                              n_factors=factors,
+                                              n_words_src=n_words_src, n_words=n_words)
+
+                    # get current n-best
+                    samples, scores, _, _, _ = gen_sample([f_init], [f_next], x, model_options,
+                                                          trng=trng, k=ramp_nbest, maxlen=maxlen,
+                                                          stochastic=False, argmax=False,
+                                                          return_alignment=False,
+                                                          suppress_unk=True,
+                                                          return_hyp_graph=False)
+
+                    # normalize by length
+                    adjusted_lengths = numpy.array([len(s) ** ramp_normalization_alpha for s in samples])
+                    scores = scores / adjusted_lengths
+
+                    # sort n-best list by most likely probability
+                    order = numpy.argsort(numpy.array(scores))  # scores are log probs -> smaller is better
+                    samples = numpy.array(samples)[order]
+                    scores = numpy.array(scores)[order]
+
+                    # map integers to words (for character-level metrics)
+                    samples_text = [seqs2words(sample[:-1], worddicts_r[-1]) for sample in samples]
+                    samples = [sample[:-1] for sample in samples]
+                    fear_for_this_sample = []
+                    hope_for_this_sample = []
+                    reward_for_this_sample = []
+                    fear_sources_for_this_sample = []
+                    hope_sources_for_this_sample = []
+                    if ramp_top1_is_hope:
+                        hope_for_this_sample.append(samples[0])
+                        hope_scores.append(scores[0])
+                        hope_sources_for_this_sample.append(x_s)
+                        logging.info("Set top1 as hope: %s ||| %s" % (source_text, samples_text[0]))
+                    if ramp_top1_is_fear:
+                        fear_for_this_sample.append(samples[0])
+                        fear_scores.append(scores[0])
+                        fear_sources_for_this_sample.append(x_s)
+                        logging.info("Set top1 as fear: %s ||| %s" % (source_text, samples_text[0]))
+                    for sample_idx, sample_text in enumerate(samples_text):
+                        sample_answer = get_nlmaps_answer(sample_text, model_options, client, ramp_weak_gold_dict,
+                                                          source_text)
+                        if sample_answer == "timeout":
+                            continue
+
+                        # compare answers to gold answer & select hope/fear
+                        if sample_answer == r_s:
+                            if ramp_top1_is_fear and sample_idx == 0:
+                                logging.info("Hope and Fear are identical, skipping example")
+                                fear_for_this_sample.pop()
+                                fear_scores.pop()
+                                fear_sources_for_this_sample.pop()
+                                break
+                            if ramp_top1_is_hope:
+                                continue
+                            if len(hope_for_this_sample) == 0:
+                                hope_for_this_sample.append(samples[sample_idx])
+                                hope_scores.append(scores[sample_idx])
+                                hope_sources_for_this_sample.append(x_s)
+                                logging.info("Found hope: %s ||| %s" % (source_text, sample_text))
+                                if 'h:%s' % x_s not in training_progress.ramp_dict:
+                                    try:
+                                        samples[sample_idx] = samples[sample_idx].tolist()
+                                    except:
+                                        pass
+                                    training_progress.ramp_dict['h:%s' % x_s] = samples[sample_idx]
+                        if sample_answer != r_s:
+                            if ramp_top1_is_hope and sample_idx == 0:
+                                logging.info("Hope and Fear are identical, skipping example")
+                                hope_for_this_sample.pop()
+                                hope_scores.pop()
+                                hope_sources_for_this_sample.pop()
+                                break
+                            if ramp_top1_is_fear:
+                                continue
+                            if len(fear_for_this_sample) == 0:
+                                fear_for_this_sample.append(samples[sample_idx])
+                                fear_scores.append(scores[sample_idx])
+                                fear_sources_for_this_sample.append(x_s)
+                                logging.info("Found fear: %s ||| %s" % (source_text, sample_text))
+                                try:
+                                    samples[sample_idx] = samples[sample_idx].tolist()
+                                except:
+                                    pass
+                                training_progress.ramp_dict['f:%s' % x_s] = samples[sample_idx]
+
+                        # break if both hope and fear have been set
+                        if len(hope_for_this_sample) != 0 and len(fear_for_this_sample):
+                            break
+
+                        # break if ramp_nloop reached
+                        if sample_idx+1 == ramp_nloop:
+                            break
+
+                    # recover previous hope/fears if desired
+                    if len(hope_for_this_sample) == 0 and ramp_reuse_previous:
+                        if 'h:%s' % x_s in training_progress.ramp_dict:
+                            hope_for_this_sample.append(training_progress.ramp_dict['h:%s' % x_s])
+                            hope_sources_for_this_sample.append(x_s)
+                            logging.info("Found hope from previous run: %s ||| %s" % (source_text, training_progress.ramp_dict['h:%s' % x_s]))
+
+                    if len(fear_for_this_sample) == 0 and ramp_reuse_previous:
+                        if 'f:%s' % x_s in training_progress.ramp_dict:
+                            fear_for_this_sample.append(training_progress.ramp_dict['f:%s' % x_s])
+                            fear_sources_for_this_sample.append(x_s)
+                            logging.info("Found fear from previous run: %s ||| %s" % (source_text, training_progress.ramp_dict['f:%s' % x_s]))
+
+                    # ensure that both hope and fear are found, else skip sample
+                    if len(hope_for_this_sample) > 0 and len(fear_for_this_sample) > 0:
+                        hope += hope_for_this_sample
+                        fear += fear_for_this_sample
+                        hope_sources += hope_sources_for_this_sample
+                        fear_sources += fear_sources_for_this_sample
+                        logging.info("Found hope and fear for sample")
+                        if ramp_word_rewards:
+                            reward_hope_for_this_sample = [1] * (len(hope_for_this_sample[0])+1)  # +1 for eos
+                            # 1 for fear is fine here, because the fear will be negated ultimately, causing an effective word reward of -1
+                            reward_fear_for_this_sample = [1] * (len(fear_for_this_sample[0])+1)  # +1 for eos
+                            fear_for_word_rewards = fear_for_this_sample[0] + [0]  # append eos
+                            hope_for_word_rewards = hope_for_this_sample[0] + [0]  # append eos
+                            
+                            # tokens only in hope are reinforced, tokens only in fear are punished, tokens in both are ignored
+                            for i, fear_token in enumerate(fear_for_word_rewards):
+                                for j, hope_token in enumerate(hope_for_word_rewards):
+                                    if hope_token == fear_token:
+                                        reward_hope_for_this_sample[j] = 0
+                                        reward_fear_for_this_sample[i] = 0
+                            
+                            reward_hope.append(reward_hope_for_this_sample)
+                            reward_fear.append(reward_fear_for_this_sample)
+
+                if len(hope) == 0:
+                    training_progress.uidx -= 1
+                    logging.info("No hope found for: %s" % source_text)
+                    ramp_skip = True
+                    continue
+
+                if len(fear) == 0:
+                    training_progress.uidx -= 1
+                    logging.info("No fear found for: %s" % source_text)
+                    ramp_skip = True
+                    continue
+
+                # create mini-batch with masking
+                reward = []
+                hope_fear = hope + fear
+                sources_hope_fear = hope_sources + fear_sources
+                if not ramp_word_rewards:
+                    reward = [1.0] * len(hope) + [1.0] * len(fear)  # else reward has already been allocated above
+                else:
+                    reward = reward_hope + reward_fear
+
+                fear_start_idx = len(hope)
+
+                x, x_mask, y, y_mask = prepare_data(sources_hope_fear, hope_fear,
+                                                    maxlen=None,
+                                                    n_factors=factors,
+                                                    n_words_src=n_words_src,
+                                                    n_words=n_words)
+
+                # rewards need to be translated and padded to fit the shape of x and y
+                prepared_rewards = reward
+                if ramp_word_rewards:
+                    prepared_rewards = [0.0] * len(y[0])
+                    for i, y_i in enumerate(y.transpose().tolist()):
+                        prepared_rewards[i] = [0.0] * len(y_i)
+                        for j, element in enumerate(y_i):
+                            prepared_rewards[i][j] = reward[i][j]
+                            if element == 0:  # then eos is reached, still assign reward to eos tho
+                                break
+                    prepared_rewards = numpy.array(prepared_rewards, dtype=floatX).transpose()
+
+                # compute cost, grads and update parameters
+                cost_batches += 1
+                cost = f_update(lrate, x, x_mask, y, y_mask, fear_start_idx, prepared_rewards)  
+                logging.info("hope_scores: %s" % hope_scores)
+                logging.info("fear_scores: %s" % fear_scores)  
+                logging.info("prepared_rewards: %s" % prepared_rewards)
+                logging.info("y: %s" % y)
+                logging.info("x: %s" % x)            
+                logging.info('Cost: %s' % cost)
+                cost_sum += cost
+                    
             elif model_options['objective'] == 'CL':
                 # propensity: probability under the logging policy
                 _, reward, propensity, y_logged, word_propensity = zip(*y)
@@ -1778,16 +2095,20 @@ def train(dim_word=512,  # word vector dimensionality
 
             # check for bad numbers, usually we remove non-finite elements
             # and continue training - but not done here
-            if numpy.isnan(cost) or numpy.isinf(cost):
-                logging.warning('NaN detected')
-                return 1., 1., 1.
+            if not ramp_skip:
+                if numpy.isnan(cost) or numpy.isinf(cost):
+                    logging.warning('NaN detected')
+                    return 1., 1., 1.
 
             # verbose
             if numpy.mod(training_progress.uidx, dispFreq) == 0:
                 ud = time.time() - ud_start
                 sps = last_disp_samples / float(ud)
                 wps = last_words / float(ud)
-                cost_avg = cost_sum / float(cost_batches)
+                if float(cost_batches) != 0:
+                    cost_avg = cost_sum / float(cost_batches)
+                else:
+                    cost_avg = 0.0
                 logging.info(
                     'Epoch {epoch} Update {update} Cost {cost} UD {ud} {sps} {wps}'.format(
                         epoch=training_progress.eidx,
@@ -1806,7 +2127,7 @@ def train(dim_word=512,  # word vector dimensionality
 
             # save the best model so far, in addition, save the latest model
             # into a separate file with the iteration number for external eval
-            if numpy.mod(training_progress.uidx, saveFreq) == 0:
+            if numpy.mod(training_progress.uidx, saveFreq) == 0 and training_progress.uidx != 0:
                 logging.info('Saving the best model...')
                 if best_p is not None:
                     params = best_p
@@ -1831,7 +2152,7 @@ def train(dim_word=512,  # word vector dimensionality
 
 
             # generate some samples with the model and display them
-            if sampleFreq and numpy.mod(training_progress.uidx, sampleFreq) == 0:
+            if sampleFreq and numpy.mod(training_progress.uidx, sampleFreq) == 0 and 0==1: #TODO this part causes some issues with RAMP, resolve why
                 # FIXME: random selection?
                 for jj in xrange(numpy.minimum(5, x.shape[2])):
                     stochastic = True
@@ -1889,7 +2210,8 @@ def train(dim_word=512,  # word vector dimensionality
                     print
 
             # validate model on validation set and early stop if necessary
-            if valid is not None and validFreq and numpy.mod(training_progress.uidx, validFreq) == 0:
+            if valid is not None and validFreq and numpy.mod(training_progress.uidx,
+                                                             validFreq) == 0 and training_progress.uidx != 0:
                 use_noise.set_value(0.)
                 valid_errs, alignment = pred_probs(f_log_probs, prepare_data,
                                         model_options, valid)
@@ -1956,7 +2278,7 @@ def train(dim_word=512,  # word vector dimensionality
                     external_validation_script_plus_counter = external_validation_script + " %s" % training_progress.nr_validations
                     popen_args = external_validation_script_plus_counter.split(" ")
                     logging.info('Calling validation script: %s' % popen_args)
-                    p_validation = Popen(popen_args)
+                    p_validation = subprocess.Popen(popen_args)
 
                 if model_options['objective'] == 'CL' and cl_reweigh is True:  # re-calculate the reweigh sum
                     reweigh_sum = 0.0
@@ -2130,7 +2452,7 @@ if __name__ == '__main__':
                          help='do not sort sentences in maxibatch by length')
     training.add_argument('--maxibatch_size', type=int, default=20, metavar='INT',
                          help='size of maxibatch (number of minibatches that are sorted by length) (default: %(default)s)')
-    training.add_argument('--objective', choices=['CE', 'MRT', 'RAML'], default='CE',
+    training.add_argument('--objective', choices=['CE', 'CL', 'MRT', 'RAML', 'RAMP'], default='CE',
                          help='training objective. CE: cross-entropy minimization (default); MRT: Minimum Risk Training (https://www.aclweb.org/anthology/P/P16/P16-1159.pdf) \
                                RAML: Reward Augmented Maximum Likelihood (https://papers.nips.cc/paper/6547-reward-augmented-maximum-likelihood-for-neural-structured-prediction.pdf)')
     training.add_argument('--encoder_truncate_gradient', type=int, default=-1, metavar='INT',
@@ -2182,6 +2504,26 @@ if __name__ == '__main__':
                           help="augment outputs with n samples (default: %(default)s)")
     raml.add_argument('--raml_reward', type=str, default='hamming_distance', metavar='STR',
                           help="reward for sampling from exponentiated payoff distribution (default: %(default)s)")
+                          
+    ramp = parser.add_argument_group('ramp parameters')
+    ramp.add_argument('--ramp_weak_gold', type=str, default=None, metavar='STR',
+                       help="location of the file with gold answers")
+    ramp.add_argument('--ramp_nbest', type=int, default=100, metavar='INT',
+                       help="n-best translations to retrieve per source sentence (default: %(default)s)")
+    ramp.add_argument('--ramp_nloop', type=int, default=10, metavar='INT',
+                       help="how many n-best translations to loop over at most (default: %(default)s)")
+    ramp.add_argument('--ramp_execution_script', type=str, default=None, metavar='PATH',
+                       help="location of the ramp exection script (default: %(default)s)")
+    ramp.add_argument('--ramp_normalization_alpha', type=float, default=1.0, metavar="ALPHA",
+                        help="Normalize scores by sentence length (with argument, exponentiate lengths by ALPHA)")
+    ramp.add_argument('--ramp_reuse_previous', action="store_true",
+                       help='save previously found hopes and fears so they can be re-used if no hope or fear can be found in the future.')
+    ramp.add_argument('--ramp_top1_is_hope', action="store_true",
+                       help='True for Ramp1.')
+    ramp.add_argument('--ramp_top1_is_fear', action="store_true",
+                       help='True for Ramp2.')
+    ramp.add_argument('--ramp_word_rewards', action="store_true",
+                       help='Use Ramp+T.')
 
     domain_interpolation = parser.add_argument_group('domain interpolation parameters')
     domain_interpolation.add_argument('--use_domain_interpolation', action='store_true',  dest='use_domain_interpolation',
