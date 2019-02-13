@@ -1,6 +1,6 @@
  RAMP LOSS OBJECTIVES
 -----------------------
-This repository implements the objectives RAMP, RAMP-T, RAMP1 and RAMP2 from [Jehl et al., 2019](TODO).
+This repository implements the objectives RAMP, RAMP-T, RAMP1 and RAMP2.
 
 SCRIPT CALLS
 ------------
